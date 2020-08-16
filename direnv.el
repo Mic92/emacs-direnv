@@ -1,3 +1,4 @@
+;;; -*- lexical-binding: t -*-
 ;;; direnv.el --- Support for direnv -*- lexical-binding: t; -*-
 
 ;; Author: wouter bolsterlee <wouter@bolsterl.ee>
@@ -44,6 +45,7 @@
 (defvar direnv--hooks '(post-command-hook before-hack-local-variables-hook)
   "Hooks that ‘direnv-mode’ should hook into.")
 
+
 (defcustom direnv-always-show-summary t
   "Whether to show a summary message of environment changes on every change.
 
@@ -89,43 +91,40 @@ use `default-directory', since there is no file name (or directory)."
                  default-directory))))
     buffer-directory))
 
-(defun direnv--export (directory)
-  "Call direnv for DIRECTORY and return the parsed result."
+
+(defun direnv--process-json (exit-code buffer callback)
+  "Called when direnv export exits in order to set the environment variables.
+STDERR-TEMPFILE is the file direnv writes to. The result is passed to CALLBACK."
+  (with-current-buffer buffer
+    (unless (zerop (buffer-size))
+      (goto-char (point-max))
+      (re-search-backward "^{")
+      (let ((json-key-type 'string))
+        (funcall callback (json-read-object))))
+    (with-temp-buffer
+      (unless (zerop exit-code)
+        (display-warning
+         'direnv
+         (format-message
+          "Error running direnv (exit code %d):\n%s\nOpen buffer ‘%s’ for full output."
+          exit-code (buffer-string) direnv--output-buffer-name))))))
+
+
+(defun direnv--export (directory callback)
+  "Execute direnv for DIRECTORY and call CALLBACK when finished."
   (unless direnv--executable
     (setq direnv--executable (direnv--detect)))
   (unless direnv--executable
     (user-error "Could not find the direnv executable. Is exec-path correct?"))
-  (let ((environment process-environment)
-        (stderr-tempfile (make-temp-file "direnv-stderr"))) ;; call-process needs a file for stderr output
-    (unwind-protect
-        (with-current-buffer (get-buffer-create direnv--output-buffer-name)
-          (erase-buffer)
-          (let* ((default-directory directory)
-                 (process-environment environment)
-                 (exit-code (call-process
-                             direnv--executable nil
-                             `(t ,stderr-tempfile) nil
-                             "export" "json")))
-            (prog1
-                (unless (zerop (buffer-size))
-                  (goto-char (point-max))
-                  (re-search-backward "^{")
-                  (let ((json-key-type 'string))
-                    (json-read-object)))
-              (unless (zerop (direnv--file-size stderr-tempfile))
-                (goto-char (point-max))
-                (unless (zerop (buffer-size))
-                  (insert "\n\n"))
-                (insert-file-contents stderr-tempfile))
-              (with-temp-buffer
-                (unless (zerop exit-code)
-                  (insert-file-contents stderr-tempfile)
-                  (display-warning
-                   'direnv
-                   (format-message
-                    "Error running direnv (exit code %d):\n%s\nOpen buffer ‘%s’ for full output."
-                    exit-code (buffer-string) direnv--output-buffer-name)))))))
-      (delete-file stderr-tempfile))))
+  (let ((environment process-environment))
+    (with-current-buffer (get-buffer-create direnv--output-buffer-name)
+      (erase-buffer)
+      (let* ((default-directory directory)
+             (process-environment environment)
+             (buffer (current-buffer))
+             (proc (start-process "direnv-export" (current-buffer) direnv--executable "export" "json")))
+        (set-process-sentinel proc (lambda (proc event)
+                                     (direnv--process-json (process-exit-status proc) buffer callback)))))))
 
 (defun direnv--file-size (name)
   "Get the file size for a file NAME."
@@ -230,26 +229,21 @@ See `direnv-update-directory-environment' for FORCE-SUMMARY."
    (if file-name (file-name-directory file-name) (direnv--directory))
    force-summary))
 
-;;;###autoload
-(defun direnv-update-directory-environment (&optional directory force-summary)
-  "Update the environment for DIRECTORY.
+;; (direnv-update-directory-environment "/etc/nixos")
+;; (direnv-update-directory-environment "/home/joerg/git/cntr")
+;; (debug-on-entry 'direnv-update-directory-environment)
 
-When FORCE-SUMMARY is non-nil or when called interactively, show a summary message."
-  (interactive)
-  (let ((directory (or directory default-directory))
-        (old-directory direnv--active-directory)
-        (items)
-        (summary)
-        (show-summary (or force-summary (called-interactively-p 'interactive))))
-    (when (file-remote-p directory)
-      (user-error "Cannot use direnv for remote files"))
-    (setq direnv--active-directory directory
-          items (direnv--export direnv--active-directory)
-          summary (direnv--summarise-changes items))
+(defun direnv--export-finished (old-directory directory items show-summary)
+  "Called when direnv is loaded.
+
+DIRECTORY is the directory where direnv was called.
+ITEMS is be the environment variables.
+when SHOW-SUMMARY it will show a summary message"
+  (let (summary (direnv--summarise-changes items))
     (when (and direnv-always-show-summary (not (string-empty-p summary)))
       (setq show-summary t))
     (when show-summary
-      (direnv--show-summary summary old-directory direnv--active-directory))
+      (direnv--show-summary summary old-directory directory))
     (dolist (pair items)
       (let ((name (car pair))
             (value (cdr pair)))
@@ -259,6 +253,21 @@ When FORCE-SUMMARY is non-nil or when called interactively, show a summary messa
           ;; Prevent `eshell-path-env` getting out-of-sync with $PATH:
           (when (derived-mode-p 'eshell-mode)
             (setq eshell-path-env value)))))))
+
+;;;###autoload
+(defun direnv-update-directory-environment (&optional directory force-summary)
+  "Update the environment for DIRECTORY.
+
+When FORCE-SUMMARY is non-nil or when called interactively, show a summary message."
+  (interactive)
+  (let ((directory (or directory default-directory))
+        (old-directory direnv--active-directory)
+        (show-summary (or force-summary (called-interactively-p 'interactive))))
+    (when (file-remote-p directory)
+      (user-error "Cannot use direnv for remote files"))
+    (direnv--export directory (lambda(items)
+                                (direnv--export-finished old-directory directory items show-summary))))
+  "Start direnv")
 
 ;;;###autoload
 (defun direnv-allow ()
